@@ -52,6 +52,7 @@ async def _run_polling() -> None:
     """Run in long-polling mode (dev, no WEBHOOK_HOST set)."""
     bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = _build_dp()
+    await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Starting in polling mode")
     await dp.start_polling(bot)
 
