@@ -2,9 +2,11 @@ import logging
 from datetime import datetime, timezone
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -17,6 +19,14 @@ scheduler = AsyncIOScheduler()
 _bot: Bot | None = None
 _session_factory: async_sessionmaker | None = None
 
+ACK_INTERVAL_SEC = 120  # repeat every 2 minutes until acknowledged
+
+
+def _ack_kb(reminder_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Прочитано", callback_data=f"ack_{reminder_id}")],
+    ])
+
 
 async def fire_reminder(reminder_id: int) -> None:
     assert _bot and _session_factory
@@ -28,13 +38,64 @@ async def fire_reminder(reminder_id: int) -> None:
         if not user:
             return
         try:
-            await _bot.send_message(user.telegram_id, f"🔔 {reminder.text}")
+            await _bot.send_message(
+                user.telegram_id,
+                f"🔔 {reminder.text}",
+                reply_markup=_ack_kb(reminder.id),
+            )
         except Exception:
             logger.exception("Failed to send reminder %d", reminder_id)
             return
+
+        # Schedule repeat every 2 min until acknowledged
+        nag_job_id = f"nag_{reminder_id}"
+        if not scheduler.get_job(nag_job_id):
+            scheduler.add_job(
+                _nag_reminder,
+                trigger=IntervalTrigger(seconds=ACK_INTERVAL_SEC),
+                args=[reminder_id],
+                id=nag_job_id,
+                replace_existing=True,
+            )
+
         if not reminder.cron_expr:
             reminder.is_active = False
             await session.commit()
+
+
+async def _nag_reminder(reminder_id: int) -> None:
+    """Re-send reminder until user acknowledges."""
+    assert _bot and _session_factory
+    async with _session_factory() as session:
+        reminder = await session.get(Reminder, reminder_id)
+        if not reminder:
+            _stop_nag(reminder_id)
+            return
+        user = await session.get(User, reminder.user_id)
+        if not user:
+            _stop_nag(reminder_id)
+            return
+        try:
+            await _bot.send_message(
+                user.telegram_id,
+                f"🔔🔔 Нагадування: {reminder.text}\n\n<i>Натисни «Прочитано» щоб зупинити</i>",
+                reply_markup=_ack_kb(reminder.id),
+            )
+        except Exception:
+            logger.exception("Failed to nag reminder %d", reminder_id)
+
+
+def acknowledge_reminder(reminder_id: int) -> None:
+    """Stop nagging for this reminder."""
+    _stop_nag(reminder_id)
+
+
+def _stop_nag(reminder_id: int) -> None:
+    nag_job_id = f"nag_{reminder_id}"
+    try:
+        scheduler.remove_job(nag_job_id)
+    except Exception:
+        pass
 
 
 def schedule_reminder(reminder: Reminder) -> None:
@@ -65,6 +126,7 @@ def cancel_reminder(reminder_id: int) -> None:
         scheduler.remove_job(job_id)
     except Exception:
         pass
+    _stop_nag(reminder_id)
 
 
 async def start_scheduler(bot: Bot, session_factory: async_sessionmaker) -> None:

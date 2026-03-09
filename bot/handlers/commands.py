@@ -21,7 +21,7 @@ from sqlalchemy import select
 from bot.calendar_kb import build_calendar, build_time_picker, build_weekday_picker
 from bot.db.engine import get_session
 from bot.db.models import Reminder, User
-from bot.scheduler import cancel_reminder, schedule_reminder
+from bot.scheduler import acknowledge_reminder, cancel_reminder, schedule_reminder
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -470,6 +470,24 @@ async def _save_reminder(
         await msg.edit_text(confirm, reply_markup=MAIN_MENU)
     else:
         await msg.answer(confirm, reply_markup=MAIN_MENU)
+
+
+# --- Acknowledge reminder ---
+
+@router.callback_query(F.data.startswith("ack_"))
+async def cb_ack(callback: CallbackQuery) -> None:
+    try:
+        rid = int(callback.data.replace("ack_", ""))
+    except (ValueError, TypeError):
+        await callback.answer("Помилка")
+        return
+
+    acknowledge_reminder(rid)
+    await callback.answer("Прочитано ✅")
+    await callback.message.edit_text(
+        f"{callback.message.text}\n\n<i>✅ Прочитано</i>",
+        reply_markup=None,
+    )
 
 
 # --- List reminders ---

@@ -3,6 +3,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import BotCommand, MenuButtonCommands
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
@@ -20,6 +21,13 @@ async def on_startup(bot: Bot) -> None:
     # Create tables (dev convenience; use alembic in prod)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Головне меню"),
+        BotCommand(command="remind", description="Створити нагадування"),
+        BotCommand(command="list", description="Мої нагадування"),
+    ])
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
     await start_scheduler(bot, async_session)
 
