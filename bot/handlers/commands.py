@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 import dateparser
@@ -18,6 +18,7 @@ from aiogram.types import (
 )
 from sqlalchemy import select
 
+from bot.calendar_kb import build_calendar, build_time_picker, build_weekday_picker
 from bot.db.engine import get_session
 from bot.db.models import Reminder, User
 from bot.scheduler import cancel_reminder, schedule_reminder
@@ -61,7 +62,10 @@ class SetTZ(StatesGroup):
 
 class NewReminder(StatesGroup):
     waiting_text = State()
-    waiting_time = State()
+    waiting_date = State()     # calendar date pick (once)
+    waiting_time = State()     # time pick (once, daily)
+    waiting_weekday = State()  # weekday pick (weekly)
+    waiting_weekly_time = State()  # time after weekday (weekly)
     waiting_cron = State()
 
 
@@ -201,77 +205,209 @@ async def on_reminder_text(message: Message, state: FSMContext) -> None:
     await state.update_data(remind_text=text)
 
     if rtype == "once":
+        today = date.today()
         await message.answer(
-            "Коли нагадати? Введи час:\n\n"
-            "Приклади: <code>завтра о 9:00</code>, <code>через 2 години</code>, <code>15.03 14:30</code>"
+            "📅 Обери дату:",
+            reply_markup=build_calendar(today.year, today.month),
         )
-        await state.set_state(NewReminder.waiting_time)
+        await state.set_state(NewReminder.waiting_date)
     elif rtype == "daily":
-        await message.answer("О котрій годині щодня? (формат <code>HH:MM</code>)")
+        await message.answer(
+            "🕐 О котрій годині щодня?",
+            reply_markup=build_time_picker(),
+        )
         await state.set_state(NewReminder.waiting_time)
     elif rtype == "weekly":
         await message.answer(
-            "В який день та час? Приклади:\n"
-            "<code>понеділок 09:00</code>, <code>friday 18:00</code>"
+            "📅 В який день тижня?",
+            reply_markup=build_weekday_picker(),
         )
-        await state.set_state(NewReminder.waiting_time)
+        await state.set_state(NewReminder.waiting_weekday)
 
+
+# --- Calendar navigation ---
+
+@router.callback_query(F.data.startswith("cal_prev_"))
+async def cb_cal_prev(callback: CallbackQuery) -> None:
+    await callback.answer()
+    _, _, _, year, month = callback.data.split("_")
+    year, month = int(year), int(month)
+    month -= 1
+    if month < 1:
+        month = 12
+        year -= 1
+    await callback.message.edit_reply_markup(reply_markup=build_calendar(year, month))
+
+
+@router.callback_query(F.data.startswith("cal_next_"))
+async def cb_cal_next(callback: CallbackQuery) -> None:
+    await callback.answer()
+    _, _, _, year, month = callback.data.split("_")
+    year, month = int(year), int(month)
+    month += 1
+    if month > 12:
+        month = 1
+        year += 1
+    await callback.message.edit_reply_markup(reply_markup=build_calendar(year, month))
+
+
+@router.callback_query(F.data == "cal_ignore")
+async def cb_cal_ignore(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+# --- Calendar date picked ---
+
+@router.callback_query(F.data.startswith("cal_day_"))
+async def cb_cal_day(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    parts = callback.data.split("_")  # cal_day_YYYY_MM_DD
+    year, month, day = int(parts[2]), int(parts[3]), int(parts[4])
+    await state.update_data(picked_date=f"{year}-{month:02d}-{day:02d}")
+
+    await callback.message.edit_text(
+        f"📅 Дата: <b>{day:02d}.{month:02d}.{year}</b>\n\n"
+        "🕐 Обери час або введи свій (формат <code>HH:MM</code>):",
+        reply_markup=build_time_picker(),
+    )
+    await state.set_state(NewReminder.waiting_time)
+
+
+# --- Time picked (button) ---
+
+@router.callback_query(F.data.startswith("time_"), NewReminder.waiting_time)
+async def cb_time_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    time_str = callback.data.replace("time_", "")
+    await _process_time_input(callback.message, state, callback.from_user.id, time_str, edit=True)
+
+
+# --- Time entered (text) ---
 
 @router.message(NewReminder.waiting_time)
 async def on_reminder_time(message: Message, state: FSMContext) -> None:
-    user = await _get_user(message.from_user.id)
+    raw = message.text.strip() if message.text else ""
+    await _process_time_input(message, state, message.from_user.id, raw, edit=False)
+
+
+async def _process_time_input(
+    msg: Message, state: FSMContext, telegram_id: int, raw: str, *, edit: bool
+) -> None:
+    user = await _get_user(telegram_id)
     if not user:
         await state.clear()
-        await message.answer("Помилка. Натисни /start")
+        await msg.answer("Помилка. Натисни /start")
         return
 
     data = await state.get_data()
     rtype = data.get("remind_type", "once")
     text = data.get("remind_text", "Нагадування")
-    raw = message.text.strip() if message.text else ""
 
     cron_expr: str | None = None
     fire_at: datetime | None = None
 
     if rtype == "once":
-        parsed = dateparser.parse(
-            raw,
-            settings={
-                "PREFER_DATES_FROM": "future",
-                "TIMEZONE": user.timezone,
-                "RETURN_AS_TIMEZONE_AWARE": True,
-            },
-        )
-        if not parsed:
-            await message.answer("Не вдалося розпізнати час. Спробуй інший формат:")
-            return
-        fire_at = parsed.astimezone(timezone.utc)
+        picked_date = data.get("picked_date")
+        if picked_date:
+            # Calendar flow: date from calendar + time from input
+            try:
+                t = datetime.strptime(raw, "%H:%M")
+            except ValueError:
+                reply = "Невірний формат. Введи час як <code>HH:MM</code> або обери кнопкою:"
+                if edit:
+                    await msg.edit_text(reply, reply_markup=build_time_picker())
+                else:
+                    await msg.answer(reply, reply_markup=build_time_picker())
+                return
+            tz = ZoneInfo(user.timezone)
+            local_dt = datetime.strptime(f"{picked_date} {raw}", "%Y-%m-%d %H:%M")
+            local_dt = local_dt.replace(tzinfo=tz)
+            fire_at = local_dt.astimezone(timezone.utc)
+        else:
+            # Fallback: dateparser
+            parsed = dateparser.parse(
+                raw,
+                settings={
+                    "PREFER_DATES_FROM": "future",
+                    "TIMEZONE": user.timezone,
+                    "RETURN_AS_TIMEZONE_AWARE": True,
+                },
+            )
+            if not parsed:
+                await msg.answer("Не вдалося розпізнати час. Спробуй інший формат:")
+                return
+            fire_at = parsed.astimezone(timezone.utc)
 
     elif rtype == "daily":
         try:
             t = datetime.strptime(raw, "%H:%M")
             cron_expr = f"{t.minute} {t.hour} * * *"
         except ValueError:
-            await message.answer("Невірний формат. Введи час як <code>HH:MM</code>:")
+            reply = "Невірний формат. Обери час кнопкою або введи <code>HH:MM</code>:"
+            if edit:
+                await msg.edit_text(reply, reply_markup=build_time_picker())
+            else:
+                await msg.answer(reply, reply_markup=build_time_picker())
             return
 
-    elif rtype == "weekly":
-        parsed = dateparser.parse(
-            raw,
-            settings={
-                "PREFER_DATES_FROM": "future",
-                "TIMEZONE": user.timezone,
-                "RETURN_AS_TIMEZONE_AWARE": True,
-            },
-        )
-        if not parsed:
-            await message.answer("Не вдалося розпізнати. Спробуй: <code>понеділок 09:00</code>")
-            return
-        dow = parsed.weekday()
-        cron_expr = f"{parsed.minute} {parsed.hour} * * {dow}"
+    await _save_reminder(msg, state, user, text, fire_at, cron_expr, edit=edit)
 
-    await _save_reminder(message, state, user, text, fire_at, cron_expr)
 
+# --- Weekday picked ---
+
+@router.callback_query(F.data.startswith("wday_"), NewReminder.waiting_weekday)
+async def cb_weekday_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    dow = int(callback.data.replace("wday_", ""))
+    await state.update_data(picked_weekday=dow)
+    await callback.message.edit_text(
+        "🕐 О котрій годині?",
+        reply_markup=build_time_picker(),
+    )
+    await state.set_state(NewReminder.waiting_weekly_time)
+
+
+@router.callback_query(F.data.startswith("time_"), NewReminder.waiting_weekly_time)
+async def cb_weekly_time_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    time_str = callback.data.replace("time_", "")
+    await _process_weekly_time(callback.message, state, callback.from_user.id, time_str, edit=True)
+
+
+@router.message(NewReminder.waiting_weekly_time)
+async def on_weekly_time(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip() if message.text else ""
+    await _process_weekly_time(message, state, message.from_user.id, raw, edit=False)
+
+
+async def _process_weekly_time(
+    msg: Message, state: FSMContext, telegram_id: int, raw: str, *, edit: bool
+) -> None:
+    user = await _get_user(telegram_id)
+    if not user:
+        await state.clear()
+        await msg.answer("Помилка. Натисни /start")
+        return
+
+    data = await state.get_data()
+    text = data.get("remind_text", "Нагадування")
+    dow = data.get("picked_weekday", 0)
+
+    try:
+        t = datetime.strptime(raw, "%H:%M")
+    except ValueError:
+        reply = "Невірний формат. Обери час кнопкою або введи <code>HH:MM</code>:"
+        if edit:
+            await msg.edit_text(reply, reply_markup=build_time_picker())
+        else:
+            await msg.answer(reply, reply_markup=build_time_picker())
+        return
+
+    cron_expr = f"{t.minute} {t.hour} * * {dow}"
+    await _save_reminder(msg, state, user, text, None, cron_expr, edit=edit)
+
+
+# --- Cron input ---
 
 @router.message(NewReminder.waiting_cron)
 async def on_reminder_cron(message: Message, state: FSMContext) -> None:
@@ -297,13 +433,17 @@ async def on_reminder_cron(message: Message, state: FSMContext) -> None:
     await _save_reminder(message, state, user, text, None, cron_expr)
 
 
+# --- Save reminder ---
+
 async def _save_reminder(
-    message: Message,
+    msg: Message,
     state: FSMContext,
     user: User,
     text: str,
     fire_at: datetime | None,
     cron_expr: str | None,
+    *,
+    edit: bool = False,
 ) -> None:
     async with get_session() as session:
         reminder = Reminder(
@@ -326,7 +466,10 @@ async def _save_reminder(
     else:
         confirm = f"✅ Нагадування #{rid} — <code>{cron_expr}</code>\n{text}"
 
-    await message.answer(confirm, reply_markup=MAIN_MENU)
+    if edit:
+        await msg.edit_text(confirm, reply_markup=MAIN_MENU)
+    else:
+        await msg.answer(confirm, reply_markup=MAIN_MENU)
 
 
 # --- List reminders ---
@@ -400,8 +543,6 @@ async def cb_delete(callback: CallbackQuery) -> None:
 
     cancel_reminder(rid)
     await callback.answer(f"Видалено #{rid}")
-
-    # Refresh the list
     await cb_list(callback)
 
 
