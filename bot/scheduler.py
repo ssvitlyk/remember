@@ -42,9 +42,12 @@ def schedule_reminder(reminder: Reminder) -> None:
     if reminder.cron_expr:
         trigger = CronTrigger.from_crontab(reminder.cron_expr)
     elif reminder.fire_at:
-        if reminder.fire_at <= datetime.now(timezone.utc):
+        fire_at = reminder.fire_at
+        if fire_at.tzinfo is None:
+            fire_at = fire_at.replace(tzinfo=timezone.utc)
+        if fire_at <= datetime.now(timezone.utc):
             return
-        trigger = DateTrigger(run_date=reminder.fire_at)
+        trigger = DateTrigger(run_date=fire_at)
     else:
         return
     scheduler.add_job(
