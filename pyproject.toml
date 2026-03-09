@@ -16,5 +16,8 @@ dependencies = [
 [project.optional-dependencies]
 prod = ["asyncpg>=0.29"]
 
+[tool.setuptools.packages.find]
+include = ["bot*"]
+
 [project.scripts]
 remember = "bot.__main__:main"
