@@ -1,5 +1,5 @@
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import dateparser
@@ -490,7 +490,44 @@ async def cb_ack(callback: CallbackQuery) -> None:
     )
 
 
-# --- List reminders ---
+# --- List reminders (day-based) ---
+
+DAYS_UA_FULL = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота", "Неділя"]
+
+
+def _day_label(d: date) -> str:
+    today = date.today()
+    if d == today:
+        prefix = "Сьогодні"
+    elif d == today + timedelta(days=1):
+        prefix = "Завтра"
+    else:
+        prefix = DAYS_UA_FULL[d.weekday()]
+    return f"{prefix}, {d.strftime('%d.%m')}"
+
+
+async def _get_user_reminders(user_id: int) -> list[Reminder]:
+    async with get_session() as session:
+        result = await session.execute(
+            select(Reminder).where(
+                Reminder.user_id == user_id, Reminder.is_active == True  # noqa: E712
+            )
+        )
+        return list(result.scalars())
+
+
+def _count_for_day(reminders: list[Reminder], d: date, tz: ZoneInfo) -> int:
+    """Count reminders that fire on a given date (one-shot by date, recurring always count)."""
+    count = 0
+    for r in reminders:
+        if r.cron_expr:
+            count += 1  # recurring shows on every day
+        elif r.fire_at:
+            fa = r.fire_at if r.fire_at.tzinfo else r.fire_at.replace(tzinfo=timezone.utc)
+            if fa.astimezone(tz).date() == d:
+                count += 1
+    return count
+
 
 @router.callback_query(F.data == "my_list")
 async def cb_list(callback: CallbackQuery) -> None:
@@ -499,13 +536,7 @@ async def cb_list(callback: CallbackQuery) -> None:
         return
     await callback.answer()
 
-    async with get_session() as session:
-        result = await session.execute(
-            select(Reminder).where(
-                Reminder.user_id == user.id, Reminder.is_active == True  # noqa: E712
-            )
-        )
-        reminders = list(result.scalars())
+    reminders = await _get_user_reminders(user.id)
 
     if not reminders:
         await callback.message.edit_text(
@@ -517,20 +548,119 @@ async def cb_list(callback: CallbackQuery) -> None:
         return
 
     tz = ZoneInfo(user.timezone)
-    lines = []
+    today = datetime.now(tz).date()
     buttons = []
-    for r in reminders:
-        if r.cron_expr:
-            lines.append(f"#{r.id} 🔁 {r.text} — <code>{r.cron_expr}</code>")
-        elif r.fire_at:
-            local = r.fire_at.astimezone(tz).strftime("%d.%m.%Y %H:%M")
-            lines.append(f"#{r.id} ⏰ {r.text} — {local}")
+    for i in range(7):
+        d = today + timedelta(days=i)
+        count = _count_for_day(reminders, d, tz)
+        label = _day_label(d)
+        if count:
+            label += f" ({count})"
         buttons.append([InlineKeyboardButton(
-            text=f"🗑 Видалити #{r.id}",
-            callback_data=f"del_{r.id}",
+            text=label,
+            callback_data=f"listday_{d.isoformat()}",
+        )])
+
+    # Recurring reminders button (always visible)
+    recurring = [r for r in reminders if r.cron_expr]
+    if recurring:
+        buttons.append([InlineKeyboardButton(
+            text=f"🔁 Повторювані ({len(recurring)})",
+            callback_data="list_recurring",
         )])
 
     buttons.append([InlineKeyboardButton(text="« Меню", callback_data="main_menu")])
+
+    await callback.message.edit_text(
+        "📋 Обери день:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("listday_"))
+async def cb_list_day(callback: CallbackQuery) -> None:
+    user = await _ensure_user(callback)
+    if not user:
+        return
+    await callback.answer()
+
+    day_str = callback.data.replace("listday_", "")
+    try:
+        d = date.fromisoformat(day_str)
+    except ValueError:
+        await callback.answer("Помилка")
+        return
+
+    tz = ZoneInfo(user.timezone)
+    reminders = await _get_user_reminders(user.id)
+
+    # Filter one-shot reminders for this day
+    day_reminders = []
+    for r in reminders:
+        if r.cron_expr:
+            continue
+        if r.fire_at:
+            fa = r.fire_at if r.fire_at.tzinfo else r.fire_at.replace(tzinfo=timezone.utc)
+            if fa.astimezone(tz).date() == d:
+                day_reminders.append(r)
+
+    if not day_reminders:
+        await callback.message.edit_text(
+            f"<b>{_day_label(d)}</b>\n\nНемає нагадувань на цей день.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="« Назад", callback_data="my_list")],
+            ]),
+        )
+        return
+
+    lines = [f"<b>{_day_label(d)}</b>\n"]
+    buttons = []
+    for r in day_reminders:
+        fa = r.fire_at if r.fire_at.tzinfo else r.fire_at.replace(tzinfo=timezone.utc)
+        local_time = fa.astimezone(tz).strftime("%H:%M")
+        lines.append(f"⏰ <b>{local_time}</b> — {r.text}")
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 Видалити: {r.text[:30]}",
+            callback_data=f"del_{r.id}",
+        )])
+
+    buttons.append([InlineKeyboardButton(text="« Назад", callback_data="my_list")])
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data == "list_recurring")
+async def cb_list_recurring(callback: CallbackQuery) -> None:
+    user = await _ensure_user(callback)
+    if not user:
+        return
+    await callback.answer()
+
+    reminders = await _get_user_reminders(user.id)
+    recurring = [r for r in reminders if r.cron_expr]
+
+    if not recurring:
+        await callback.message.edit_text(
+            "Немає повторюваних нагадувань.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="« Назад", callback_data="my_list")],
+            ]),
+        )
+        return
+
+    lines = ["<b>🔁 Повторювані</b>\n"]
+    buttons = []
+    for r in recurring:
+        lines.append(f"🔁 {r.text} — <code>{r.cron_expr}</code>")
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 Видалити: {r.text[:30]}",
+            callback_data=f"del_{r.id}",
+        )])
+
+    buttons.append([InlineKeyboardButton(text="« Назад", callback_data="my_list")])
 
     await callback.message.edit_text(
         "\n".join(lines),
@@ -561,6 +691,7 @@ async def cb_delete(callback: CallbackQuery) -> None:
 
     cancel_reminder(rid)
     await callback.answer(f"Видалено #{rid}")
+    # Return to day list
     await cb_list(callback)
 
 
@@ -640,33 +771,35 @@ async def cmd_list(message: Message) -> None:
         await message.answer("Спочатку натисни /start")
         return
 
-    async with get_session() as session:
-        result = await session.execute(
-            select(Reminder).where(
-                Reminder.user_id == user.id, Reminder.is_active == True  # noqa: E712
-            )
-        )
-        reminders = list(result.scalars())
+    reminders = await _get_user_reminders(user.id)
 
     if not reminders:
         await message.answer("Немає активних нагадувань.", reply_markup=MAIN_MENU)
         return
 
     tz = ZoneInfo(user.timezone)
-    lines = []
+    today = datetime.now(tz).date()
     buttons = []
-    for r in reminders:
-        if r.cron_expr:
-            lines.append(f"#{r.id} 🔁 {r.text} — <code>{r.cron_expr}</code>")
-        elif r.fire_at:
-            local = r.fire_at.astimezone(tz).strftime("%d.%m.%Y %H:%M")
-            lines.append(f"#{r.id} ⏰ {r.text} — {local}")
+    for i in range(7):
+        d = today + timedelta(days=i)
+        count = _count_for_day(reminders, d, tz)
+        label = _day_label(d)
+        if count:
+            label += f" ({count})"
         buttons.append([InlineKeyboardButton(
-            text=f"🗑 Видалити #{r.id}",
-            callback_data=f"del_{r.id}",
+            text=label,
+            callback_data=f"listday_{d.isoformat()}",
         )])
+
+    recurring = [r for r in reminders if r.cron_expr]
+    if recurring:
+        buttons.append([InlineKeyboardButton(
+            text=f"🔁 Повторювані ({len(recurring)})",
+            callback_data="list_recurring",
+        )])
+
     buttons.append([InlineKeyboardButton(text="« Меню", callback_data="main_menu")])
-    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await message.answer("📋 Обери день:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 @router.message(Command("delete"))
