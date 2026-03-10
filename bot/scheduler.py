@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -34,8 +34,24 @@ def _priority_prefix(r: Reminder) -> str:
 
 def _ack_kb(reminder_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Прочитано", callback_data=f"ack_{reminder_id}")],
+        [
+            InlineKeyboardButton(text="✅ Прочитано", callback_data=f"ack_{reminder_id}"),
+            InlineKeyboardButton(text="⏰ +1 год", callback_data=f"snooze_{reminder_id}"),
+        ],
     ])
+
+
+def snooze_reminder(reminder_id: int) -> None:
+    """Stop nagging and reschedule reminder +1 hour from now."""
+    _stop_nag(reminder_id)
+    fire_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    scheduler.add_job(
+        fire_reminder,
+        trigger=DateTrigger(run_date=fire_at),
+        args=[reminder_id],
+        id=f"reminder_{reminder_id}",
+        replace_existing=True,
+    )
 
 
 async def fire_reminder(reminder_id: int) -> None:
