@@ -29,6 +29,8 @@ class Reminder(Base):
     text: Mapped[str] = mapped_column(Text)
     fire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cron_expr: Mapped[str | None] = mapped_column(String(100))
+    is_urgent: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_important: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

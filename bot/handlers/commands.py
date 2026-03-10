@@ -62,11 +62,20 @@ class SetTZ(StatesGroup):
 
 class NewReminder(StatesGroup):
     waiting_text = State()
-    waiting_date = State()     # calendar date pick (once)
-    waiting_time = State()     # time pick (once, daily)
-    waiting_weekday = State()  # weekday pick (weekly)
+    waiting_priority = State()  # urgent/important selection
+    waiting_date = State()      # calendar date pick (once)
+    waiting_time = State()      # time pick (once, daily)
+    waiting_weekday = State()   # weekday pick (weekly)
     waiting_weekly_time = State()  # time after weekday (weekly)
     waiting_cron = State()
+
+
+PRIORITY_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🔴 Терміново + Важливо", callback_data="pri_urgent_important")],
+    [InlineKeyboardButton(text="🟠 Терміново", callback_data="pri_urgent")],
+    [InlineKeyboardButton(text="🔵 Важливо", callback_data="pri_important")],
+    [InlineKeyboardButton(text="⚪ Звичайне", callback_data="pri_normal")],
+])
 
 
 # --- Helpers ---
@@ -200,25 +209,37 @@ async def on_reminder_text(message: Message, state: FSMContext) -> None:
         await message.answer("Текст не може бути порожнім. Спробуй ще:")
         return
 
+    await state.update_data(remind_text=text)
+    await message.answer("Обери пріоритет:", reply_markup=PRIORITY_KB)
+    await state.set_state(NewReminder.waiting_priority)
+
+
+@router.callback_query(F.data.startswith("pri_"), NewReminder.waiting_priority)
+async def cb_priority(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    pri = callback.data.replace("pri_", "")
+    is_urgent = "urgent" in pri
+    is_important = "important" in pri
+    await state.update_data(is_urgent=is_urgent, is_important=is_important)
+
     data = await state.get_data()
     rtype = data.get("remind_type", "once")
-    await state.update_data(remind_text=text)
 
     if rtype == "once":
         today = date.today()
-        await message.answer(
+        await callback.message.edit_text(
             "📅 Обери дату:",
             reply_markup=build_calendar(today.year, today.month),
         )
         await state.set_state(NewReminder.waiting_date)
     elif rtype == "daily":
-        await message.answer(
+        await callback.message.edit_text(
             "🕐 О котрій годині щодня?",
             reply_markup=build_time_picker(),
         )
         await state.set_state(NewReminder.waiting_time)
     elif rtype == "weekly":
-        await message.answer(
+        await callback.message.edit_text(
             "📅 В який день тижня?",
             reply_markup=build_weekday_picker(),
         )
@@ -435,6 +456,16 @@ async def on_reminder_cron(message: Message, state: FSMContext) -> None:
 
 # --- Save reminder ---
 
+def _priority_icon(r: Reminder) -> str:
+    if r.is_urgent and r.is_important:
+        return "🔴"
+    elif r.is_urgent:
+        return "🟠"
+    elif r.is_important:
+        return "🔵"
+    return "⚪"
+
+
 async def _save_reminder(
     msg: Message,
     state: FSMContext,
@@ -445,12 +476,18 @@ async def _save_reminder(
     *,
     edit: bool = False,
 ) -> None:
+    data = await state.get_data()
+    is_urgent = data.get("is_urgent", False)
+    is_important = data.get("is_important", False)
+
     async with get_session() as session:
         reminder = Reminder(
             user_id=user.id,
             text=text,
             fire_at=fire_at,
             cron_expr=cron_expr,
+            is_urgent=is_urgent,
+            is_important=is_important,
         )
         session.add(reminder)
         await session.flush()
@@ -459,12 +496,13 @@ async def _save_reminder(
 
     await state.clear()
     tz = ZoneInfo(user.timezone)
+    icon = _priority_icon(reminder)
 
     if fire_at:
         local_time = fire_at.astimezone(tz).strftime("%d.%m.%Y %H:%M")
-        confirm = f"✅ Нагадування #{rid} — <b>{local_time}</b>\n{text}"
+        confirm = f"✅ {icon} Нагадування #{rid} — <b>{local_time}</b>\n{text}"
     else:
-        confirm = f"✅ Нагадування #{rid} — <code>{cron_expr}</code>\n{text}"
+        confirm = f"✅ {icon} Нагадування #{rid} — <code>{cron_expr}</code>\n{text}"
 
     if edit:
         await msg.edit_text(confirm, reply_markup=MAIN_MENU)
@@ -618,7 +656,8 @@ async def cb_list_day(callback: CallbackQuery) -> None:
     for r in day_reminders:
         fa = r.fire_at if r.fire_at.tzinfo else r.fire_at.replace(tzinfo=timezone.utc)
         local_time = fa.astimezone(tz).strftime("%H:%M")
-        lines.append(f"⏰ <b>{local_time}</b> — {r.text}")
+        icon = _priority_icon(r)
+        lines.append(f"{icon} <b>{local_time}</b> — {r.text}")
         buttons.append([InlineKeyboardButton(
             text=f"🗑 Видалити: {r.text[:30]}",
             callback_data=f"del_{r.id}",
@@ -654,7 +693,8 @@ async def cb_list_recurring(callback: CallbackQuery) -> None:
     lines = ["<b>🔁 Повторювані</b>\n"]
     buttons = []
     for r in recurring:
-        lines.append(f"🔁 {r.text} — <code>{r.cron_expr}</code>")
+        icon = _priority_icon(r)
+        lines.append(f"{icon} 🔁 {r.text} — <code>{r.cron_expr}</code>")
         buttons.append([InlineKeyboardButton(
             text=f"🗑 Видалити: {r.text[:30]}",
             callback_data=f"del_{r.id}",

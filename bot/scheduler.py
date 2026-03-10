@@ -22,6 +22,16 @@ _session_factory: async_sessionmaker | None = None
 ACK_INTERVAL_SEC = 120  # repeat every 2 minutes until acknowledged
 
 
+def _priority_prefix(r: Reminder) -> str:
+    if r.is_urgent and r.is_important:
+        return "🔴 ТЕРМІНОВО! "
+    elif r.is_urgent:
+        return "🟠 Терміново: "
+    elif r.is_important:
+        return "🔵 Важливо: "
+    return ""
+
+
 def _ack_kb(reminder_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Прочитано", callback_data=f"ack_{reminder_id}")],
@@ -37,10 +47,11 @@ async def fire_reminder(reminder_id: int) -> None:
         user = await session.get(User, reminder.user_id)
         if not user:
             return
+        pri = _priority_prefix(reminder)
         try:
             await _bot.send_message(
                 user.telegram_id,
-                f"🔔 {reminder.text}",
+                f"🔔 {pri}{reminder.text}",
                 reply_markup=_ack_kb(reminder.id),
             )
         except Exception:
@@ -75,10 +86,11 @@ async def _nag_reminder(reminder_id: int) -> None:
         if not user:
             _stop_nag(reminder_id)
             return
+        pri = _priority_prefix(reminder)
         try:
             await _bot.send_message(
                 user.telegram_id,
-                f"🔔🔔 Нагадування: {reminder.text}\n\n<i>Натисни «Прочитано» щоб зупинити</i>",
+                f"🔔🔔 {pri}{reminder.text}\n\n<i>Натисни «Прочитано» щоб зупинити</i>",
                 reply_markup=_ack_kb(reminder.id),
             )
         except Exception:
