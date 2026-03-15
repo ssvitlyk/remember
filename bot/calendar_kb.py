@@ -79,6 +79,36 @@ def build_time_picker() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+MULTITIME_PRESETS = [
+    "06:00", "07:00", "08:00",
+    "09:00", "10:00", "12:00",
+    "14:00", "16:00", "18:00",
+    "20:00", "21:00", "22:00",
+]
+
+
+def build_multitime_picker(selected: list[str] | None = None) -> InlineKeyboardMarkup:
+    """Time picker where multiple times can be toggled on/off."""
+    selected = selected or []
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(MULTITIME_PRESETS), 3):
+        row = []
+        for t in MULTITIME_PRESETS[i:i + 3]:
+            label = f"✅ {t}" if t in selected else t
+            row.append(InlineKeyboardButton(text=label, callback_data=f"mtime_{t}"))
+        rows.append(row)
+
+    bottom = []
+    if selected:
+        bottom.append(InlineKeyboardButton(
+            text=f"✅ Готово ({len(selected)})",
+            callback_data="mtime_done",
+        ))
+    bottom.append(InlineKeyboardButton(text="« Назад", callback_data="main_menu"))
+    rows.append(bottom)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def build_weekday_picker() -> InlineKeyboardMarkup:
     """Pick a day of week for weekly reminders."""
     days = [

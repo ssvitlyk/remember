@@ -18,7 +18,7 @@ from aiogram.types import (
 )
 from sqlalchemy import select
 
-from bot.calendar_kb import build_calendar, build_time_picker, build_weekday_picker
+from bot.calendar_kb import build_calendar, build_multitime_picker, build_time_picker, build_weekday_picker
 from bot.db.engine import get_session
 from bot.db.models import Reminder, User
 from bot.scheduler import acknowledge_all, acknowledge_reminder, cancel_reminder, schedule_reminder, snooze_reminder
@@ -48,6 +48,7 @@ def _remind_type_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏰ Одноразове", callback_data="type_once")],
         [InlineKeyboardButton(text="🔁 Щоденне", callback_data="type_daily")],
+        [InlineKeyboardButton(text="💊 Кілька разів на день", callback_data="type_multitime")],
         [InlineKeyboardButton(text="📅 Щотижневе", callback_data="type_weekly")],
         [InlineKeyboardButton(text="⚙️ Cron-вираз", callback_data="type_cron")],
         [InlineKeyboardButton(text="« Назад", callback_data="main_menu")],
@@ -65,6 +66,7 @@ class NewReminder(StatesGroup):
     waiting_priority = State()  # urgent/important selection
     waiting_date = State()      # calendar date pick (once)
     waiting_time = State()      # time pick (once, daily)
+    waiting_multitime = State() # multi-time pick (several times a day)
     waiting_weekday = State()   # weekday pick (weekly)
     waiting_weekly_time = State()  # time after weekday (weekly)
     waiting_cron = State()
@@ -238,6 +240,13 @@ async def cb_priority(callback: CallbackQuery, state: FSMContext) -> None:
             reply_markup=build_time_picker(),
         )
         await state.set_state(NewReminder.waiting_time)
+    elif rtype == "multitime":
+        await state.update_data(selected_times=[])
+        await callback.message.edit_text(
+            "💊 Обери години прийому (натисни кілька разів):",
+            reply_markup=build_multitime_picker(),
+        )
+        await state.set_state(NewReminder.waiting_multitime)
     elif rtype == "weekly":
         await callback.message.edit_text(
             "📅 В який день тижня?",
@@ -374,6 +383,87 @@ async def _process_time_input(
     await _save_reminder(msg, state, user, text, fire_at, cron_expr, edit=edit)
 
 
+# --- Multi-time toggle ---
+
+@router.callback_query(F.data.startswith("mtime_"), NewReminder.waiting_multitime)
+async def cb_multitime_toggle(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    action = callback.data.replace("mtime_", "")
+
+    data = await state.get_data()
+    selected: list[str] = data.get("selected_times", [])
+
+    if action == "done":
+        if not selected:
+            return
+        user = await _get_user(callback.from_user.id)
+        if not user:
+            await state.clear()
+            await callback.message.edit_text("Помилка. Натисни /start")
+            return
+
+        text = data.get("remind_text", "Нагадування")
+        selected.sort()
+        hours = ",".join(str(int(t.split(":")[0])) for t in selected)
+        minutes = ",".join(str(int(t.split(":")[1])) for t in selected)
+        # If all minutes are the same, use one value
+        unique_minutes = set(int(t.split(":")[1]) for t in selected)
+        if len(unique_minutes) == 1:
+            cron_expr = f"{unique_minutes.pop()} {hours} * * *"
+        else:
+            # Different minutes per time — create separate reminders
+            for t in selected:
+                h, m = t.split(":")
+                cron = f"{int(m)} {int(h)} * * *"
+                await _save_reminder(
+                    callback.message, state, user, text, None, cron,
+                    edit=True, clear_state=False,
+                )
+            await state.clear()
+            times_str = ", ".join(selected)
+            await callback.message.edit_text(
+                f"✅ Створено {len(selected)} нагадувань: <b>{times_str}</b>\n{text}",
+                reply_markup=MAIN_MENU,
+            )
+            return
+
+        await _save_reminder(callback.message, state, user, text, None, cron_expr, edit=True)
+        return
+
+    # Toggle time on/off
+    if action in selected:
+        selected.remove(action)
+    else:
+        selected.append(action)
+    await state.update_data(selected_times=selected)
+
+    await callback.message.edit_reply_markup(
+        reply_markup=build_multitime_picker(selected),
+    )
+
+
+@router.message(NewReminder.waiting_multitime)
+async def on_multitime_text(message: Message, state: FSMContext) -> None:
+    """Allow typing custom time like 07:30 to add to selection."""
+    raw = message.text.strip() if message.text else ""
+    try:
+        t = datetime.strptime(raw, "%H:%M")
+        time_str = t.strftime("%H:%M")
+    except ValueError:
+        await message.answer("Невірний формат. Введи час як <code>HH:MM</code> або обери кнопкою.")
+        return
+
+    data = await state.get_data()
+    selected: list[str] = data.get("selected_times", [])
+    if time_str not in selected:
+        selected.append(time_str)
+    await state.update_data(selected_times=selected)
+    await message.answer(
+        f"💊 Додано {time_str}. Обрано: <b>{', '.join(sorted(selected))}</b>",
+        reply_markup=build_multitime_picker(selected),
+    )
+
+
 # --- Weekday picked ---
 
 @router.callback_query(F.data.startswith("wday_"), NewReminder.waiting_weekday)
@@ -475,6 +565,7 @@ async def _save_reminder(
     cron_expr: str | None,
     *,
     edit: bool = False,
+    clear_state: bool = True,
 ) -> None:
     data = await state.get_data()
     is_urgent = data.get("is_urgent", False)
@@ -493,6 +584,9 @@ async def _save_reminder(
         await session.flush()
         schedule_reminder(reminder)
         rid = reminder.id
+
+    if not clear_state:
+        return
 
     await state.clear()
     tz = ZoneInfo(user.timezone)
