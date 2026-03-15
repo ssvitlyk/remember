@@ -21,7 +21,7 @@ from sqlalchemy import select
 from bot.calendar_kb import build_calendar, build_time_picker, build_weekday_picker
 from bot.db.engine import get_session
 from bot.db.models import Reminder, User
-from bot.scheduler import acknowledge_reminder, cancel_reminder, schedule_reminder, snooze_reminder
+from bot.scheduler import acknowledge_all, acknowledge_reminder, cancel_reminder, schedule_reminder, snooze_reminder
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -541,6 +541,19 @@ async def cb_snooze(callback: CallbackQuery) -> None:
     await callback.answer("Відкладено на 1 годину")
     await callback.message.edit_text(
         f"{callback.message.text}\n\n<i>⏰ Відкладено до {snooze_time} UTC</i>",
+        reply_markup=None,
+    )
+
+
+@router.callback_query(F.data == "ack_all")
+async def cb_ack_all(callback: CallbackQuery) -> None:
+    rids = acknowledge_all(callback.from_user.id)
+    if not rids:
+        await callback.answer("Немає непрочитаних")
+        return
+    await callback.answer(f"Прочитано: {len(rids)} ✅")
+    await callback.message.edit_text(
+        f"{callback.message.text}\n\n<i>✅ Всі прочитані ({len(rids)})</i>",
         reply_markup=None,
     )
 
