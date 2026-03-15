@@ -23,6 +23,8 @@ ACK_INTERVAL_SEC = 120  # repeat every 2 minutes until acknowledged
 
 # Track reminders pending acknowledgement: {telegram_id: {reminder_id, ...}}
 _pending_ack: dict[int, set[int]] = {}
+# Track sent notification message IDs to delete before re-sending: {telegram_id: [msg_id, ...]}
+_pending_msg_ids: dict[int, list[int]] = {}
 
 
 def _priority_prefix(r: Reminder) -> str:
@@ -103,6 +105,16 @@ def _grouped_nag_kb(reminders: list[Reminder]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def _delete_prev_messages(telegram_id: int) -> None:
+    """Delete all previously sent nag/notification messages for this user."""
+    msg_ids = _pending_msg_ids.pop(telegram_id, [])
+    for msg_id in msg_ids:
+        try:
+            await _bot.delete_message(telegram_id, msg_id)
+        except Exception:
+            pass  # message may already be deleted/edited by user
+
+
 def snooze_reminder(reminder_id: int) -> None:
     """Stop nagging and reschedule reminder +1 hour from now."""
     _remove_pending(reminder_id)
@@ -125,12 +137,15 @@ async def fire_reminder(reminder_id: int) -> None:
         user = await session.get(User, reminder.user_id)
         if not user:
             return
+        # Delete previous unacked messages before sending new one
+        await _delete_prev_messages(user.telegram_id)
         try:
-            await _bot.send_message(
+            msg = await _bot.send_message(
                 user.telegram_id,
                 _format_notification(reminder),
                 reply_markup=_ack_kb(reminder.id),
             )
+            _pending_msg_ids.setdefault(user.telegram_id, []).append(msg.message_id)
         except Exception:
             logger.exception("Failed to send reminder %d", reminder_id)
             return
@@ -173,15 +188,19 @@ async def _nag_sweep(telegram_id: int) -> None:
             _stop_sweep(telegram_id)
             return
 
+        # Delete previous messages before sending new nag
+        await _delete_prev_messages(telegram_id)
+
         # Single reminder — individual format
         if len(reminders) == 1:
             r = reminders[0]
             try:
-                await _bot.send_message(
+                msg = await _bot.send_message(
                     telegram_id,
                     _format_notification(r, nag=True),
                     reply_markup=_ack_kb(r.id),
                 )
+                _pending_msg_ids.setdefault(telegram_id, []).append(msg.message_id)
             except Exception:
                 logger.exception("Failed to nag reminder %d", r.id)
             return
@@ -200,11 +219,12 @@ async def _nag_sweep(telegram_id: int) -> None:
         lines.append("\n<i>Натисни «Прочитано» щоб зупинити</i>")
 
         try:
-            await _bot.send_message(
+            msg = await _bot.send_message(
                 telegram_id,
                 "\n".join(lines),
                 reply_markup=_grouped_nag_kb(reminders),
             )
+            _pending_msg_ids.setdefault(telegram_id, []).append(msg.message_id)
         except Exception:
             logger.exception("Failed to send grouped nag to %d", telegram_id)
 
@@ -217,6 +237,7 @@ def acknowledge_reminder(reminder_id: int) -> None:
 def acknowledge_all(telegram_id: int) -> list[int]:
     """Acknowledge all pending reminders for a user. Returns list of acked IDs."""
     rids = list(_pending_ack.pop(telegram_id, set()))
+    _pending_msg_ids.pop(telegram_id, None)
     _stop_sweep(telegram_id)
     return rids
 
