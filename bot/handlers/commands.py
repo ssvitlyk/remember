@@ -2,6 +2,8 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from apscheduler.triggers.cron import CronTrigger
+
 import dateparser
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
@@ -606,7 +608,7 @@ async def _save_reminder(
 
 # --- Acknowledge reminder ---
 
-@router.callback_query(F.data.startswith("ack_"))
+@router.callback_query(F.data.regexp(r"^ack_\d+$"))
 async def cb_ack(callback: CallbackQuery) -> None:
     try:
         rid = int(callback.data.replace("ack_", ""))
@@ -678,12 +680,25 @@ async def _get_user_reminders(user_id: int) -> list[Reminder]:
         return list(result.scalars())
 
 
+def _cron_fires_on_day(cron_expr: str, d: date, tz: ZoneInfo) -> bool:
+    """Check if a cron expression fires at least once on a given date."""
+    try:
+        trigger = CronTrigger.from_crontab(cron_expr, timezone=tz)
+        day_start = datetime(d.year, d.month, d.day, tzinfo=tz)
+        day_end = day_start + timedelta(days=1)
+        nxt = trigger.get_next_fire_time(None, day_start)
+        return nxt is not None and nxt < day_end
+    except Exception:
+        return False
+
+
 def _count_for_day(reminders: list[Reminder], d: date, tz: ZoneInfo) -> int:
-    """Count reminders that fire on a given date (one-shot by date, recurring always count)."""
+    """Count reminders that fire on a given date."""
     count = 0
     for r in reminders:
         if r.cron_expr:
-            count += 1  # recurring shows on every day
+            if _cron_fires_on_day(r.cron_expr, d, tz):
+                count += 1
         elif r.fire_at:
             fa = r.fire_at if r.fire_at.tzinfo else r.fire_at.replace(tzinfo=timezone.utc)
             if fa.astimezone(tz).date() == d:
@@ -756,17 +771,19 @@ async def cb_list_day(callback: CallbackQuery) -> None:
     tz = ZoneInfo(user.timezone)
     reminders = await _get_user_reminders(user.id)
 
-    # Filter one-shot reminders for this day
-    day_reminders = []
+    # Filter reminders for this day (one-shot + recurring)
+    oneshot = []
+    recurring = []
     for r in reminders:
         if r.cron_expr:
-            continue
-        if r.fire_at:
+            if _cron_fires_on_day(r.cron_expr, d, tz):
+                recurring.append(r)
+        elif r.fire_at:
             fa = r.fire_at if r.fire_at.tzinfo else r.fire_at.replace(tzinfo=timezone.utc)
             if fa.astimezone(tz).date() == d:
-                day_reminders.append(r)
+                oneshot.append(r)
 
-    if not day_reminders:
+    if not oneshot and not recurring:
         await callback.message.edit_text(
             f"<b>{_day_label(d)}</b>\n\nНемає нагадувань на цей день.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -777,11 +794,18 @@ async def cb_list_day(callback: CallbackQuery) -> None:
 
     lines = [f"<b>{_day_label(d)}</b>\n"]
     buttons = []
-    for r in day_reminders:
+    for r in oneshot:
         fa = r.fire_at if r.fire_at.tzinfo else r.fire_at.replace(tzinfo=timezone.utc)
         local_time = fa.astimezone(tz).strftime("%H:%M")
         icon = _priority_icon(r)
         lines.append(f"{icon} <b>{local_time}</b> — {r.text}")
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 Видалити: {r.text[:30]}",
+            callback_data=f"del_{r.id}",
+        )])
+    for r in recurring:
+        icon = _priority_icon(r)
+        lines.append(f"{icon} 🔁 {r.text} — <code>{r.cron_expr}</code>")
         buttons.append([InlineKeyboardButton(
             text=f"🗑 Видалити: {r.text[:30]}",
             callback_data=f"del_{r.id}",
