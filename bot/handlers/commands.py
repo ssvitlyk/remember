@@ -262,8 +262,8 @@ async def cb_priority(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("cal_prev_"))
 async def cb_cal_prev(callback: CallbackQuery) -> None:
     await callback.answer()
-    _, _, _, year, month = callback.data.split("_")
-    year, month = int(year), int(month)
+    parts = callback.data.split("_")  # cal_prev_YYYY_MM
+    year, month = int(parts[2]), int(parts[3])
     month -= 1
     if month < 1:
         month = 12
@@ -274,8 +274,8 @@ async def cb_cal_prev(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("cal_next_"))
 async def cb_cal_next(callback: CallbackQuery) -> None:
     await callback.answer()
-    _, _, _, year, month = callback.data.split("_")
-    year, month = int(year), int(month)
+    parts = callback.data.split("_")  # cal_next_YYYY_MM
+    year, month = int(parts[2]), int(parts[3])
     month += 1
     if month > 12:
         month = 1
